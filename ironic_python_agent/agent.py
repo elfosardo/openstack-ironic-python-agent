@@ -305,10 +305,15 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
 
         return source
 
-    def _test_ip_reachability(self, ip_address):
+    def _test_ip_reachability(self, ip_address, timeout=5):
         """Test if an IP address is reachable via HTTP GET request.
 
+        Uses a shorter timeout for reachability testing to avoid delays
+        in case of network issues. If none of the provided URLs are reachable,
+        all tests fail.
+
         :param ip_address: The IP address to test
+        :param timeout: Timeout for reachability test (default: 5 seconds)
         :returns: True if the IP is reachable, False otherwise
         """
         test_urls = [
@@ -318,15 +323,19 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
 
         for url in test_urls:
             try:
-                # Disable SSL verification for reachability testing only
+                # Use shorter timeout for reachability testing
                 response = requests.get(
-                    url, timeout=CONF.http_request_timeout, verify=False
+                    url, timeout=timeout, verify=False
                 )  # nosec
                 # Any HTTP response (even 404, 500, etc.) indicates
                 # reachability
                 LOG.debug('IP %s is reachable via %s (status: %s)',
                           ip_address, url, response.status_code)
                 return True
+            except requests.exceptions.Timeout:
+                LOG.debug('IP %s reachability test timed out after %ds via %s',
+                          ip_address, timeout, url)
+                continue
             except requests.exceptions.RequestException as e:
                 LOG.debug('IP %s not reachable via %s: %s',
                           ip_address, url, e)
@@ -337,13 +346,14 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
     def _find_routable_addr(self):
         # Process API URLs: check reachability and collect IPs in one pass
         reachable_api_urls = []
+        unreachable_api_urls = []
         ips = set()
 
         for api_url in self.api_urls:
             ironic_host = urlparse.urlparse(api_url).hostname
 
-            # Test reachability once per hostname
-            if self._test_ip_reachability(ironic_host):
+            # Test reachability once per hostname with a shorter timeout
+            if self._test_ip_reachability(ironic_host, timeout=5):
                 reachable_api_urls.append(api_url)
                 LOG.debug('API URL %s is reachable', api_url)
 
@@ -356,6 +366,7 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
                               ironic_host)
                     ips.add(ironic_host)
             else:
+                unreachable_api_urls.append(api_url)
                 LOG.debug('API URL %s is not reachable, skipping', api_url)
 
         # Update api_urls configuration to only include reachable endpoints
@@ -363,8 +374,16 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
             LOG.info('Filtered API URLs from %d to %d reachable endpoints',
                      len(self.api_urls), len(reachable_api_urls))
             self.api_urls = reachable_api_urls
+            # Keep at least one unreachable URL as fallback if available
+            if unreachable_api_urls:
+                self.api_urls.append(unreachable_api_urls[0])
+                LOG.info('Keeping first unreachable URL as fallback: %s',
+                         unreachable_api_urls[0])
         else:
             LOG.warning('No reachable Ironic API URLs found, keeping all URLs')
+            # Ensure we always have at least one URL
+            if not self.api_urls:
+                LOG.error('No API URLs available! This should not happen.')
 
         # Find routable address using collected IPs
         for attempt in range(self.ip_lookup_attempts):
